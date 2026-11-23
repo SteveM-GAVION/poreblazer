@@ -24,15 +24,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container: debian:bookworm
+    env:
+      OMPI_ALLOW_RUN_AS_ROOT: 1
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
     timeout-minutes: 45
     steps:
       - name: Install the compiler
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends gfortran make git python3 ca-certificates
+          apt-get install -y --no-install-recommends gfortran make git python3 ca-certificates libopenmpi-dev openmpi-bin
       - uses: actions/checkout@v4
-      - name: Build the fork
-        run: make -C src
+      - name: Build the fork (serial and MPI)
+        run: |
+          make -C src
+          make -C src mpi
       - name: Build upstream 3.0.5 to compare with
         run: |
           git clone --quiet "$UPSTREAM_REPO" /tmp/upstream
@@ -40,10 +45,14 @@ jobs:
           make -C /tmp/upstream/src
       - name: Percolation unit tests
         run: |
-          gfortran -O2 src/percolation.f90 tests/test_percolation.f90 -o /tmp/test_percolation
+          gfortran -O2 -cpp src/parallel.f90 src/percolation.f90 tests/test_percolation.f90 -o /tmp/test_percolation
           /tmp/test_percolation
+          mpif90 -O2 -fopenmp -cpp -DUSE_MPI src/parallel.f90 src/percolation.f90 tests/test_percolation_mpi.f90 -o /tmp/test_mpi
+          for n in 1 2 3 4; do OMP_NUM_THREADS=2 mpirun --oversubscribe -n $n /tmp/test_mpi; done
       - name: Compare with upstream
         run: python3 tests/run_tests.py --fork src/poreblazer.exe --upstream /tmp/upstream/src/poreblazer.exe --threads 1 4
+      - name: The MPI build matches the exact reference on 1 to 4 ranks
+        run: python3 tests/run_tests.py --fork src/poreblazer-mpi.exe --mpi 1 2 3 4 --mpirun "mpirun --oversubscribe" --threads 1
 
   image:
     needs: test
@@ -75,5 +84,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
       - name: Check the published image runs
         run: |
+          docker run --rm --entrypoint sh "$IMAGE:ambuild" -c 'ldd /opt/poreblazer/poreblazer-mpi.exe | grep -c "not found" | grep -q "^0$"'
           docker run --rm --entrypoint ls "$IMAGE:ambuild" -l /opt/poreblazer/poreblazer.exe
           docker run --rm --entrypoint sh "$IMAGE:ambuild" -c 'ldd /opt/poreblazer/poreblazer.exe | grep -c "not found" | grep -q "^0$"'

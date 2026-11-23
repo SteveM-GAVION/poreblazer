@@ -38,27 +38,40 @@ end module adsorbent
 module lattice
         real*8                   :: cube_size                                         ! size of the lattice cubelet
         integer                  :: ncubesx, ncubesy, ncubesz                         ! number of lattice cubes in each direction and other parameters
-        integer                  :: ntot, spanning                                    ! total number of lattice cubes,  logical variable for percolation
-        integer                  :: nhe_cubes, nn_cubes, ng_cubes                     ! number of lattice cubes accessible to helium, nitrogen and a point, respectively
+        integer*8                :: ntot                                              ! total number of lattice cubes
+        integer                  :: spanning                                          ! logical variable for percolation
+        integer*8                :: nhe_cubes, nn_cubes, ng_cubes                     ! number of lattice cubes accessible to helium, nitrogen and a point, respectively (whole grid)
+        ! The grid is split over MPI ranks in slabs of z planes (module parallel): this
+        ! rank holds planes z0..z1, and every grid array below is dimensioned (:, :, z0:z1).
+        ! With one rank (and in the serial build) z0 = 1 and z1 = ncubesz.
+        integer                  :: z0 = 1, z1 = 0
+        integer                  :: ng_local = 0, nn_local = 0                        ! the counts in this rank's slab
         integer*1, allocatable   :: lattice_space(:,:,:)                              ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
         integer*1, allocatable   :: lattice_temp(:,:,:)                               ! temp array for various uses: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
         integer, allocatable     :: cl_summary(:,:)                                   ! cluster summary: stores information about percolating clusters and the number of percolated dimensions
         real*8, allocatable      :: lattice_rdist2(:,:,:)                             ! squared distances between the center of the cubelet and nearest atom of the structure
         integer*1, allocatable   :: lattice_space_he(:,:,:), lattice_space_n(:,:,:)   ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible) for helim and nitrogen
-        integer, allocatable     :: n_cubes(:)                                        ! nitrogen-accessible cubes, by cube number (sized to their count)
-        real*8, allocatable      :: lattice_lj_he(:)                                  ! for each cube i, summary of the LJ interaction between the He atom in the center of the cube and the structure
-        real*8,  allocatable     :: PA1(:)                                            ! pore radii (squared) of the geometrically accessible cubes, sorted ascending
+        integer, allocatable     :: n_cubes(:)                                        ! nitrogen-accessible cubes of this slab, by local cube number (sized to their count)
+        real*8, allocatable      :: lattice_lj_he(:,:,:)                              ! for each cube, summary of the LJ interaction between the He atom in the center of the cube and the structure
+        real*8,  allocatable     :: PA1(:)                                            ! pore radii (squared) of this slab's geometrically accessible cubes, sorted ascending
 
 contains
 
-    ! The indices (j, k, l) of cube number icount (numbered with j fastest, then k, then l)
+    ! The indices (j, k, l) of this slab's local cube number icount (numbered with j
+    ! fastest, then k, then l from plane z0); l is the plane in the whole grid
     subroutine cube_ijk(icount, j, k, l)
         integer, intent(in)  :: icount
         integer, intent(out) :: j, k, l
         j = mod(icount - 1, ncubesx) + 1
         k = mod((icount - 1)/ncubesx, ncubesy) + 1
-        l = (icount - 1)/(ncubesx*ncubesy) + 1
+        l = (icount - 1)/(ncubesx*ncubesy) + z0
     end subroutine cube_ijk
+
+    ! The local cube number of cube (j, k, l) of this slab
+    integer function cube_local(j, k, l)
+        integer, intent(in) :: j, k, l
+        cube_local = ((l-z0) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
+    end function cube_local
 
 end module lattice
 
@@ -190,6 +203,7 @@ contains
 end module atomcells
 
 program poreblazer
+use parallel, only: par_init, par_finalize, par_rank
 implicit none
 interface initialize
     subroutine initialize(arg)
@@ -199,6 +213,15 @@ end interface initialize
 
 
 character(len=256) :: arg
+character(len=16) :: timing_env
+logical :: timing
+integer*8 :: clock0, clock1, rate
+
+! With MPI, rank 0 writes the log and every output file; the other ranks only compute
+call par_init()
+if(par_rank > 0) open(6, file='/dev/null', status='old', action='write')
+call get_environment_variable("POREBLAZER_TIMING", timing_env)
+timing = len_trim(timing_env) > 0
 
 write(*,*) "!-------------------------------------------------------!"
 write(*,*) "! Welcome to Poreblazer_v3.0.5/Linux/Windows XP         !"
@@ -229,7 +252,9 @@ end if
 !--------------------------------------------------------------------------------------
 
 write(*,*) "Step 2/8"
+call system_clock(clock0, rate)
 call lattice_calculations
+call report_time("lattice")
 
 !--------------------------------------------------------------------------------------
 !      Now we sequentially call several routines where the actual
@@ -237,17 +262,29 @@ call lattice_calculations
 !--------------------------------------------------------------------------------------
 
 write(*,*) "Step 3/8"
+call system_clock(clock0, rate)
 call helium_lattice              ! returns lattice accessible to helium
+call report_time("helium lattice")
 write(*,*) "Step 4/8"
+call system_clock(clock0, rate)
 call nitrogen_lattice            ! returns lattice accessible to nitrogen
+call report_time("nitrogen lattice")
 write(*,*) "Step 5/8"
+call system_clock(clock0, rate)
 call helium_volume               ! helium volume
+call report_time("helium volume")
 write(*,*) "Step 6/8"
+call system_clock(clock0, rate)
 call surface_area                ! accessible surface area
+call report_time("surface area")
 write(*,*) "Step 7/8"
+call system_clock(clock0, rate)
 call pore_distribution           ! geometric pore size distribution
+call report_time("pore size distribution")
 write(*,*) "Step 8/8"
+call system_clock(clock0, rate)
 call limiting_diameter           ! calculation of the pore limiting diamater
+call report_time("limiting diameter")
 
 call finalize
 
@@ -255,6 +292,16 @@ write(*,*) "!-------------------------------------------------------!"
 write(*,*) "! Simulation complete                                   !"
 write(*,*) "!-------------------------------------------------------!"
 
+call par_finalize()
+
+contains
+
+    ! With POREBLAZER_TIMING set, rank 0 writes each step's wall time to stderr (not the log)
+    subroutine report_time(step)
+        character(len=*), intent(in) :: step
+        call system_clock(clock1)
+        if(timing .and. par_rank == 0) write(0, '(a, a, f10.3, a)') " timing: ", step, dble(clock1 - clock0)/dble(rate), " s"
+    end subroutine report_time
 
 end program
 
@@ -284,10 +331,12 @@ subroutine initialize(filename)
     use  vector, only:  vectype
     use random, only:   random_init
     use results
-    use percolation, only: percolation_labelling
+    use percolation, only: percolation_labelling, percolation_set_slab
+    use parallel, only: par_rank, par_size, par_slab, par_abort, par_bcast_line
 
     implicit none
-    character(len=*), optional :: filename                                              ! input filename, defaults stdin
+    character(len=1024)                   :: stdin_lines(3)
+    character(len=*), optional :: filename                                            ! input filename, defaults stdin
     integer*4                             :: i, j, k, l                                 ! cycle indicies
     logical                               :: check                                      ! logical variable, required for input analysis
     character(256)                        :: filename1, filename2, filename3            ! data file names
@@ -314,9 +363,19 @@ subroutine initialize(filename)
         close(4)
     else
         filename3 = "defaults.dat"
-        read(*,*) filename2  !  name of the xyz coordinates file
-        read(*,*) fcell%ell(1), fcell%ell(2), fcell%ell(3)    ! non-orthorhombic dimensions of the simulation cell
-        read(*,*) fcell%anglebc, fcell%angleac, fcell%angleab ! cell angles  (RDbl)  (alpha,beta,gamma)
+        ! Only rank 0 can read stdin under mpirun: it reads the three lines and shares them
+        stdin_lines = ' '
+        if(par_rank == 0) then
+            do i=1, 3
+                read(*,'(a)') stdin_lines(i)
+            end do
+        end if
+        do i=1, 3
+            call par_bcast_line(stdin_lines(i))
+        end do
+        read(stdin_lines(1),*) filename2  !  name of the xyz coordinates file
+        read(stdin_lines(2),*) fcell%ell(1), fcell%ell(2), fcell%ell(3)    ! non-orthorhombic dimensions of the simulation cell
+        read(stdin_lines(3),*) fcell%anglebc, fcell%angleac, fcell%angleab ! cell angles  (RDbl)  (alpha,beta,gamma)
     end if
 
     open(2, file=Trim(adjustl(filename2)), status='old')
@@ -433,6 +492,7 @@ subroutine initialize(filename)
     coords(2, :) = coords(2, :) - atvec1%comp(2)
     coords(3, :) = coords(3, :) - atvec1%comp(3)
 
+    if(par_rank == 0) then
     open(40, file = 'new.xyz')
     write(40,*) natoms     !  number of atoms in the strucutre
 
@@ -443,6 +503,7 @@ subroutine initialize(filename)
     end do
 
     close(40)
+    end if
 
     ncubesx = int(fcell%eff(1)/cube_size)                ! number of cubelets on x side
     cube_size = fcell%eff(1)/dble(ncubesx)               ! corrected size of the cubelet
@@ -450,12 +511,20 @@ subroutine initialize(filename)
     ncubesy = int(fcell%eff(2)/cube_size)                ! number of cubelets on y side
     ncubesz = int(fcell%eff(3)/cube_size)                ! number of cubelets on z side
 
-    ntot = ncubesx*ncubesy*ncubesz                       ! total number of lattice cubelets in the system
-    allocate(lattice_space(ncubesx, ncubesy, ncubesz), lattice_temp(ncubesx, ncubesy, ncubesz))
-    allocate(lattice_rdist2(ncubesx, ncubesy, ncubesz))
-    allocate(lattice_space_he(ncubesx, ncubesy, ncubesz))
-    allocate(lattice_space_n(ncubesx, ncubesy, ncubesz))
-    allocate(lattice_lj_he(ntot))
+    ntot = int(ncubesx, 8)*ncubesy*ncubesz               ! total number of lattice cubelets in the system
+
+    ! This rank's slab of z planes (all of them on one rank)
+    if(ncubesz < par_size) call par_abort("More MPI ranks than grid planes along z; use fewer ranks")
+    call par_slab(ncubesz, par_rank, z0, z1)
+    if(int(ncubesx, 8)*ncubesy*(z1 - z0 + 1) > huge(0)) &
+        call par_abort("More than 2**31 grid cubes on one rank; use more MPI ranks or a larger cubelet size")
+    call percolation_set_slab(ncubesz, z0)
+
+    allocate(lattice_space(ncubesx, ncubesy, z0:z1), lattice_temp(ncubesx, ncubesy, z0:z1))
+    allocate(lattice_rdist2(ncubesx, ncubesy, z0:z1))
+    allocate(lattice_space_he(ncubesx, ncubesy, z0:z1))
+    allocate(lattice_space_n(ncubesx, ncubesy, z0:z1))
+    allocate(lattice_lj_he(ncubesx, ncubesy, z0:z1))
     allocate(cl_summary(20,2))
 
     lattice_space = 0; lattice_temp = 0
@@ -492,6 +561,11 @@ subroutine initialize(filename)
     else
         percolation_labelling = 0
         write(*,*) "Percolation labelling: poreblazer"
+    end if
+    if(par_size > 1) then
+        if(percolation_labelling /= 1) call par_abort("Poreblazer's percolation labelling needs one MPI rank: "// &
+            "use exact labelling (1 after the visualisation option in defaults.dat) to split the grid")
+        write(*,'(a,i0,a,i0,a)') " MPI ranks: ", par_size, " (slabs of about ", ncubesz/par_size, " z planes)"
     end if
 
     close(1)
@@ -553,20 +627,21 @@ subroutine lattice_calculations
 
     use fundcell, only:     fundamental_cell, fundcell_snglminimage, fundcell_isortho
     use vector, only:       vectype
+    use parallel, only:     par_sum_i8
 
     implicit none
 
     real*8, parameter                  :: cell_target = 2.0d0       ! width of the cell-list cells (A)
     real*8, parameter                  :: margin = 1.0d-3           ! cells are searched to hicut + margin (A)
-    real*8                             :: maxsigma, reach, x, xl, yl, zl, metric, u(3,3)
-    integer*4                          :: i, j, k, l, icount, a, b, d, n, ix, iy, iz, ncand, maxnb
-    integer                            :: c(3), ncubes(3), nnb(3)
+    real*8                             :: maxsigma, reach, x, xl, yl, zl, metric, u(3,3), erc
+    integer*4                          :: i, j, k, l, icount, a, b, d, n, ix, iy, iz, ncand, maxnb, necand
+    integer                            :: c(3), ncubes(3), nnb(3), lfirst, llast, nhe_local
     logical                            :: exact, ortho
-    integer, allocatable               :: all_atoms(:), pfirst(:,:), plast(:,:), nbr(:,:), cand(:)
+    integer, allocatable               :: all_atoms(:), pfirst(:,:), plast(:,:), nbr(:,:), cand(:), ecand(:)
     real*8, allocatable                :: gap(:,:), d2(:)
     real*8, allocatable                :: ax(:), ay(:), az(:), aov(:), ahalf(:), as2he(:), alj(:)
     real*8, allocatable                :: cx(:), cy(:), cz(:), cov(:), chalf(:), cs2he(:), ceps(:)
-    logical, allocatable               :: mark(:)
+    real*8, allocatable                :: ex(:), ey(:), ez(:), eov(:), ehalf(:), es2he(:), eeps(:)
 
 
     write(*,*) "!-------------------------------------------------------!"
@@ -632,54 +707,46 @@ subroutine lattice_calculations
         end do
     end do
 
+    ! Only this rank's planes z0..z1 (all of them on one rank). A cubelet whose answer the
+    ! cutoff list cannot settle (the nearest atom or surface could lie beyond the cutoff: a
+    ! pore wider than about twice the cutoff) is retried with the atoms within twice the
+    ! radius, then four times, ..., until it is settled or the list holds every atom.
+    ! Upstream checks every atom at once; the result is the same (lattice_cube), but in a
+    ! large cell with wide pores the cost stays local. The wider list is built once per
+    ! cell and kept for the cell's other cubelets.
     !$omp parallel default(shared) private(a, b, c, d, n, ix, iy, iz, j, k, l, ncand, nnb, exact, &
-    !$omp nbr, gap, mark, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2)
-    allocate(nbr(maxnb, 3), gap(maxnb, 3), mark(natoms), cand(natoms), d2(natoms), &
+    !$omp nbr, gap, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2, lfirst, llast, &
+    !$omp necand, ecand, ex, ey, ez, eov, ehalf, es2he, eeps, erc)
+    allocate(nbr(maxnb, 3), gap(maxnb, 3), cand(natoms), d2(natoms), &
              cx(natoms), cy(natoms), cz(natoms), cov(natoms), chalf(natoms), cs2he(natoms), ceps(natoms))
-    mark = .False.
+    allocate(ecand(natoms), ex(natoms), ey(natoms), ez(natoms), eov(natoms), ehalf(natoms), es2he(natoms), &
+             eeps(natoms))
     !$omp do collapse(3) schedule(dynamic)
     do iz=0, ncell(3)-1
         do iy=0, ncell(2)-1
             do ix=0, ncell(1)-1
+                lfirst = max(pfirst(iz,3), z0)
+                llast = min(plast(iz,3), z1)
+                if(lfirst > llast) cycle
                 c = (/ ix, iy, iz /)
-                do d=1, 3
-                    call atomcells_neighbours(c(d), d, reach, nbr(:,d), gap(:,d), nnb(d))
-                end do
 
                 ! Candidate atoms: those in cells closer than the cutoff, in ascending order
-                do l=1, nnb(3)
-                    do k=1, nnb(2)
-                        do j=1, nnb(1)
-                            if(gap(j,1)**2 + gap(k,2)**2 + gap(l,3)**2 >= reach*reach) cycle
-                            b = 1 + nbr(j,1) + ncell(1)*(nbr(k,2) + ncell(2)*nbr(l,3))
-                            do n=cell_start(b), cell_start(b+1)-1
-                                mark(cell_atoms(n)) = .True.
-                            end do
-                        end do
-                    end do
-                end do
-                ncand = 0
-                do n=1, natoms
-                    if(mark(n)) then
-                        ncand = ncand + 1
-                        cand(ncand) = n
-                        cx(ncand) = ax(n)
-                        cy(ncand) = ay(n)
-                        cz(ncand) = az(n)
-                        cov(ncand) = aov(n)
-                        chalf(ncand) = ahalf(n)
-                        cs2he(ncand) = as2he(n)
-                        ceps(ncand) = alj(n)
-                        mark(n) = .False.
-                    end if
-                end do
+                call cell_atoms_within(c, reach, ncand, cand, cx, cy, cz, cov, chalf, cs2he, ceps)
+                erc = 0.0d0
 
-                do l=pfirst(iz,3), plast(iz,3)
+                do l=lfirst, llast
                     do k=pfirst(iy,2), plast(iy,2)
                         do j=pfirst(ix,1), plast(ix,1)
-                            call lattice_cube(j, k, l, ncand, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2, exact)
-                            if(.not. exact) call lattice_cube(j, k, l, natoms, all_atoms, ax, ay, az, aov, ahalf, &
-                                                              as2he, alj, d2, exact)
+                            call lattice_cube(j, k, l, ncand, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2, hicut, exact)
+                            if(.not. exact .and. erc > 0.0d0) &
+                                call lattice_cube(j, k, l, necand, ecand, ex, ey, ez, eov, ehalf, es2he, eeps, d2, erc, exact)
+                            do while(.not. exact)
+                                if(erc == 0.0d0) erc = hicut
+                                erc = 2.0d0*erc
+                                call cell_atoms_within(c, (erc + margin)/sqrt(max(metric, tiny(0.0d0))), necand, ecand, &
+                                                       ex, ey, ez, eov, ehalf, es2he, eeps)
+                                call lattice_cube(j, k, l, necand, ecand, ex, ey, ez, eov, ehalf, es2he, eeps, d2, erc, exact)
+                            end do
                         end do
                     end do
                 end do
@@ -687,32 +754,37 @@ subroutine lattice_calculations
         end do
     end do
     !$omp end do
-    deallocate(nbr, gap, mark, cand, d2, cx, cy, cz, cov, chalf, cs2he, ceps)
+    deallocate(nbr, gap, cand, d2, cx, cy, cz, cov, chalf, cs2he, ceps)
+    deallocate(ecand, ex, ey, ez, eov, ehalf, es2he, eeps)
     !$omp end parallel
     deallocate(all_atoms, ax, ay, az, aov, ahalf, as2he, alj, pfirst, plast)
 
-    ! Counts of geometrically, helium- and nitrogen-accessible cubelets, and the list of
-    ! nitrogen-accessible cubelets in cubelet order (the PSD samples from it). The helium
-    ! volume reads the helium mask directly.
-    do l=1, ncubesz
+    ! Counts of geometrically, helium- and nitrogen-accessible cubelets (in this slab, then
+    ! the whole grid), and the list of this slab's nitrogen-accessible cubelets in cubelet
+    ! order (the PSD samples from it). The helium volume reads the helium mask directly.
+    nhe_local = 0
+    do l=z0, z1
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l) < 1) cycle
-                ng_cubes = ng_cubes + 1
-                if(lattice_space_he(j,k,l) == 1) nhe_cubes = nhe_cubes + 1
-                if(lattice_space_n(j,k,l) == 1) nn_cubes = nn_cubes + 1
+                ng_local = ng_local + 1
+                if(lattice_space_he(j,k,l) == 1) nhe_local = nhe_local + 1
+                if(lattice_space_n(j,k,l) == 1) nn_local = nn_local + 1
             end do
         end do
     end do
-    allocate(n_cubes(max(1, nn_cubes)))
+    ng_cubes = par_sum_i8(int(ng_local, 8))
+    nhe_cubes = par_sum_i8(int(nhe_local, 8))
+    nn_cubes = par_sum_i8(int(nn_local, 8))
+    allocate(n_cubes(max(1, nn_local)))
     n_cubes = 0
     n = 0
-    do l=1, ncubesz
+    do l=z0, z1
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l) < 1 .or. lattice_space_n(j,k,l) /= 1) cycle
                 n = n + 1
-                n_cubes(n) = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
+                n_cubes(n) = cube_local(j, k, l)
             end do
         end do
     end do
@@ -726,25 +798,103 @@ subroutine lattice_calculations
 
 contains
 
+    ! The atoms in cells that can lie within reach (slanted) of a point in cell c, in
+    ! ascending order, with their positions and type parameters: the atoms within reach
+    ! times sqrt(metric) (Cartesian) of it, and perhaps some farther. Every atom when
+    ! there are no cells. Gathered from the cells and sorted (upstream-order sums need
+    ! ascending atoms), so the cost follows the atoms nearby, not every atom.
+    subroutine cell_atoms_within(c, reach, n, list, x, y, z, ov, half, s2he, eps)
+        integer, intent(in)                :: c(3)
+        real*8, intent(in)                 :: reach
+        integer, intent(out)               :: n
+        integer, intent(out)               :: list(:)
+        real*8, intent(out)                :: x(:), y(:), z(:), ov(:), half(:), s2he(:), eps(:)
+        integer                            :: d, i1, i2, i3, b, m, nb(maxnb, 3), nn(3)
+        real*8                             :: g(maxnb, 3)
+        do d=1, 3
+            call atomcells_neighbours(c(d), d, reach, nb(:,d), g(:,d), nn(d))
+        end do
+        n = 0
+        do i3=1, nn(3)
+            do i2=1, nn(2)
+                do i1=1, nn(1)
+                    if(g(i1,1)**2 + g(i2,2)**2 + g(i3,3)**2 >= reach*reach) cycle
+                    b = 1 + nb(i1,1) + ncell(1)*(nb(i2,2) + ncell(2)*nb(i3,3))
+                    do m=cell_start(b), cell_start(b+1)-1
+                        n = n + 1
+                        list(n) = cell_atoms(m)
+                    end do
+                end do
+            end do
+        end do
+        call sort_ints(list, n)
+        do m=1, n
+            b = list(m)
+            x(m) = ax(b)
+            y(m) = ay(b)
+            z(m) = az(b)
+            ov(m) = aov(b)
+            half(m) = ahalf(b)
+            s2he(m) = as2he(b)
+            eps(m) = alj(b)
+        end do
+    end subroutine cell_atoms_within
+
+    ! In-place heap sort of v(1:n), ascending
+    subroutine sort_ints(v, n)
+        integer, intent(inout)             :: v(:)
+        integer, intent(in)                :: n
+        integer                            :: i, last, t, root, child, m
+        do i=n, 1, -1
+            ! sift down from i (building the heap), then from 1 (taking the largest off)
+            if(i > n/2) cycle
+            root = i
+            do while(2*root <= n)
+                child = 2*root
+                if(child < n) then
+                    if(v(child) < v(child+1)) child = child + 1
+                end if
+                if(v(root) >= v(child)) exit
+                t = v(root); v(root) = v(child); v(child) = t
+                root = child
+            end do
+        end do
+        do last=n, 2, -1
+            t = v(1); v(1) = v(last); v(last) = t
+            m = last - 1
+            root = 1
+            do while(2*root <= m)
+                child = 2*root
+                if(child < m) then
+                    if(v(child) < v(child+1)) child = child + 1
+                end if
+                if(v(root) >= v(child)) exit
+                t = v(root); v(root) = v(child); v(child) = t
+                root = child
+            end do
+        end do
+    end subroutine sort_ints
+
     ! One cubelet, checking the atoms list(1:nlist) (ascending), whose positions and type
-    ! parameters are x, y, z, ov, half, s2he and eps(1:nlist); d2 is workspace. exact is
-    ! false, and nothing is stored, when an atom outside the list could still be the
-    ! nearest atom or give the nearest surface; the list always holds every atom within
-    ! the cutoff, so the overlap test and the Lennard-Jones sum are exact either way.
-    subroutine lattice_cube(j, k, l, nlist, list, x, y, z, ov, half, s2he, eps, d2, exact)
+    ! parameters are x, y, z, ov, half, s2he and eps(1:nlist); d2 is workspace. The list
+    ! holds every atom within rc (A, at least the cutoff), so the overlap test and the
+    ! Lennard-Jones sum are exact. exact is false, and nothing is stored, when an atom
+    ! outside the list could still be the nearest atom or give the nearest surface; with
+    ! a longer list (a larger rc) the answer is the same, as the atoms added are beyond
+    ! the cutoff and farther than those found.
+    subroutine lattice_cube(j, k, l, nlist, list, x, y, z, ov, half, s2he, eps, d2, rc, exact)
         integer, intent(in)                :: j, k, l, nlist
         integer, intent(in)                :: list(nlist)
         real*8, intent(in)                 :: x(nlist), y(nlist), z(nlist), ov(nlist), half(nlist), s2he(nlist), eps(nlist)
         real*8, intent(inout)              :: d2(nlist)
+        real*8, intent(in)                 :: rc
         logical, intent(out)               :: exact
         type(vectype)                      :: atvec1, sepvec
         real*8                             :: px, py, pz, d1, dd2, d3, q1, q2, q3, r1, r2, r3, s1, s2, s3
         real*8                             :: rdist2, rdist6, rdist12, rdist2_ref, rdist_surface, rdist_surface_ref
         real*8                             :: sig2_rdist2, lj_energy, lj_sum
-        integer                            :: n, icount, amin
+        integer                            :: n, amin
         logical                            :: overlap
-
-        icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j                                ! count cubelets
 
         ! calculate the coordinates of the center of each cubelet
         atvec1%comp = (/dble(j-1), dble(k-1), dble(l-1)/) * cube_size + (0.5 * cube_size)
@@ -839,10 +989,10 @@ contains
         end do
 
         exact = overlap .or. nlist == natoms .or. &
-                (rdist2_ref < hicut2 .and. rdist_surface_ref + 0.5*maxsigma < hicut)
+                (rdist2_ref < rc*rc .and. rdist_surface_ref + 0.5*maxsigma < rc)
         if(.not. exact) return
 
-        lattice_lj_he(icount) = lj_sum
+        lattice_lj_he(j,k,l) = lj_sum
 
         if(overlap.eqv..True.) then                          ! if an overlap was detected, this whole cubelet is ignored
             return
@@ -900,6 +1050,7 @@ subroutine nitrogen_lattice
     use parameters
     use lattice
     use percolation, only:  percolation_calc
+    use parallel, only:     par_sum_i8
     use fundcell, only:     fundcell_unslant
     use vector, only:       vectype
     use defaults, only:     radTodeg
@@ -911,7 +1062,8 @@ subroutine nitrogen_lattice
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    call percolation_calc(lattice_space_n, n_cubes, nn_cubes, cl_summary)
+    call percolation_calc(lattice_space_n, n_cubes, nn_local, cl_summary)
+    nn_cubes = par_sum_i8(int(nn_local, 8))
 
     ! vusalization options: 1 -xyz, 2 - grd, 3 - both; 0 - none
     if(vis_option == 1) then 
@@ -945,9 +1097,11 @@ subroutine helium_volume
     use adsorbent
     use fundcell, only: fundamental_cell, fundcell_getvolume
     use results
+    use parallel, only: par_rank, par_size, par_send_d, par_recv_d
 
     implicit none
     integer ::                            i, j, k, l, cube_number
+    real*8  ::                            buf(1)
     real*8  ::                            lj_energy, bf !, pore_v_he, pore_geom, volume  ! Moved these variables to the results module.
 
     write(*,*) "!-------------------------------------------------------!"
@@ -958,21 +1112,42 @@ subroutine helium_volume
     pore_v_he = 0.0
 
     ! The helium-accessible cubelets that percolate, in cubelet order: the percolation
-    ! analysis leaves exactly these marked in lattice_space_he (upstream kept a list)
-    do l=1, ncubesz
+    ! analysis leaves exactly these marked in lattice_space_he (upstream kept a list).
+    ! The Boltzmann factors are computed in parallel (in place of the energies, which
+    ! nothing reads afterwards), then summed in cubelet order, so the sum is upstream's:
+    ! with MPI, each rank continues the running sum of the ranks below it.
+    !$omp parallel do default(shared) private(j, k, l, lj_energy)
+    do l=z0, z1
     do k=1, ncubesy
     do j=1, ncubesx
-
         if(lattice_space_he(j,k,l) /= 1) cycle
-        cube_number = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
-
-        lj_energy = lattice_lj_he(cube_number)      ! total LJ energy of cubelet cube_number and its environment within cut-off distance
+        lj_energy = lattice_lj_he(j,k,l)            ! total LJ energy of the cubelet and its environment within cut-off distance
         lj_energy = 4.0 * lj_energy
-        bf = exp(-lj_energy/temp)                   ! Boltzmann factor for cubelet cube_number
+        lattice_lj_he(j,k,l) = exp(-lj_energy/temp) ! Boltzmann factor for the cubelet
+    end do
+    end do
+    end do
+    !$omp end parallel do
+
+    buf = 0.0d0
+    if(par_rank > 0) call par_recv_d(buf, 1, par_rank - 1, 21)
+    pore_v_he = buf(1)
+    do l=z0, z1
+    do k=1, ncubesy
+    do j=1, ncubesx
+        if(lattice_space_he(j,k,l) /= 1) cycle
+        bf = lattice_lj_he(j,k,l)
         pore_v_he = pore_v_he + bf                  ! second virial as a sum of Boltzmann factors over all cubelets
     end do
     end do
     end do
+    if(par_size > 1) then
+        buf(1) = pore_v_he
+        if(par_rank < par_size - 1) call par_send_d(buf, 1, par_rank + 1, 21)
+        if(par_rank == par_size - 1) call par_send_d(buf, 1, 0, 22)
+        if(par_rank == 0) call par_recv_d(buf, 1, par_size - 1, 22)
+        pore_v_he = buf(1)
+    end if
 
     pore_v_he = pore_v_he/dble(ntot)            ! averaging over the whole sample
 
@@ -1026,6 +1201,7 @@ subroutine surface_area
     use vector, only:     vectype
     Use random, only:     rranf
     use results
+    use parallel, only:   par_sum_i4_array
 
     implicit none
     real*8                                :: phi, costheta, theta
@@ -1125,6 +1301,7 @@ subroutine surface_area
             if(ny<1) ny = ny +  (1-(ny/ncubesy))*ncubesy
             if(nz>ncubesz) nz = nz - (nz/ncubesz)*ncubesz
             if(nz<1) nz = nz +  (1-(nz/ncubesz))*ncubesz
+            if(nz < z0 .or. nz > z1) cycle        ! another rank's planes: it counts this point
             if(lattice_space_n(nx,ny,nz)<1) cycle ! reject the point if it is within an atom
             !----------------------
             ! now we perform the overlap test, i.e. we ensure that the selected point is not inside
@@ -1183,6 +1360,8 @@ subroutine surface_area
     !$omp end do
     deallocate(nbr, gap)
     !$omp end parallel
+    ! every trial point was counted by the rank holding its plane
+    call par_sum_i4_array(counts, i1 - i0 + 1)
 
     do i=i0, i1
         ! fraction of the accessible surface area for sphere i
@@ -1234,15 +1413,20 @@ subroutine pore_distribution
     use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant, fundcell_isortho
     Use vector, only: vectype
     Use random, Only: rranf
+    use parallel, only: par_rank, par_sum_i4_array, par_max_d, par_max_d_array, par_exscan_i8
 
 
     implicit none
     type(vectype)                         :: atvec1, atvec2, sepvec
-    integer                               :: i, j, k, l, nx, ny, nz, nx1, ny1, nz1, icount, m, bin, isite
+    integer                               :: i, j, k, l, nx, ny, nz, nx1, ny1, nz1, icount, m, bin
+    integer*8                             :: isite, nn_offset
+    integer, allocatable                  :: sxyz(:,:)
+    real*8, allocatable                   :: sbest(:)
+    integer                               :: bz0, bz1
     real*8                                :: sigma_ref, sigma2_ref, rdist2
     real*8                                :: deldis1, deldis2, deldis
     integer, parameter                    :: nsamples = 10000
-    integer, allocatable                  :: sites(:), bins(:)
+    integer, allocatable                  :: bins(:)
     real*8                                :: rmax2, best, v, t, g2, xq(3), lo, hi, metric
     integer                               :: bsz, nb(3), nblocks, n, d, bx, by, bz, j1, k1, l1
     logical                               :: ortho
@@ -1262,8 +1446,8 @@ subroutine pore_distribution
     ! here we go through all cubelets geometrically accessible, store distances between the centers of cubelets
     ! and the surface of the nearest neighbour atom in PA1 array, and sort PA1 in an ascending order
 
-    allocate(PA1(max(1, ng_cubes)))
-    do l=1, ncubesz
+    allocate(PA1(max(1, ng_local)))
+    do l=z0, z1
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l)<1) cycle
@@ -1276,9 +1460,10 @@ subroutine pore_distribution
     ! Only the radii are kept and sorted (upstream carried each cubelet's indices along):
     ! the search below finds spheres by blocks of the grid, and the limiting diameter
     ! needs only the sorted radii and the cubelets above a radius, which it finds on the grid.
+    ! With MPI each rank sorts its own slab's; the limiting diameter combines them.
     !$omp parallel default(shared)
     !$omp single
-    call parallel_sort_values(1, ng_cubes, PA1)
+    call parallel_sort_values(1, ng_local, PA1)
     !$omp end single
     !$omp end parallel
 
@@ -1289,13 +1474,26 @@ subroutine pore_distribution
     end if
 
     ! Draw every sample site first, in the order the serial code drew them, so that the
-    ! samples can run in parallel and give the same distribution as before
-    allocate(sites(nsamples), bins(nsamples))
+    ! samples can run in parallel and give the same distribution as before. A site is a
+    ! position in the list of nitrogen-accessible cubelets of the whole grid, which with
+    ! MPI is the ranks' lists in rank order: the rank holding a site gives its cubelet.
+    allocate(sxyz(3, nsamples), sbest(nsamples), bins(nsamples))
+    sxyz = 0
+    nn_offset = par_exscan_i8(int(nn_local, 8))
     do i = 1, nsamples
-        isite = int(rranf()*dble(nn_cubes)) + 1 ! randomly select an available cubelet
+        isite = int(rranf()*dble(nn_cubes), 8) + 1 ! randomly select an available cubelet
         if(isite > nn_cubes) isite = nn_cubes
-        sites(i) = isite
+        if(isite > nn_offset .and. isite <= nn_offset + nn_local) &
+            call cube_ijk(n_cubes(int(isite - nn_offset)), sxyz(1, i), sxyz(2, i), sxyz(3, i))
     end do
+    call par_sum_i4_array(sxyz, 3*nsamples)
+    ! The radius of each sample's own cubelet, which contains it: a first answer, shared so that every
+    ! rank starts its search from it
+    sbest = -1.0d0
+    do i = 1, nsamples
+        if(sxyz(3, i) >= z0 .and. sxyz(3, i) <= z1) sbest(i) = lattice_rdist2(sxyz(1, i), sxyz(2, i), sxyz(3, i))
+    end do
+    call par_max_d_array(sbest, nsamples)
 
     ! Each sample takes the largest sphere, among the geometrically accessible cubelets,
     ! that contains its point: upstream scans the cubelets from the largest radius down and
@@ -1305,15 +1503,21 @@ subroutine pore_distribution
     ! block farther from the point than its largest radius is skipped: the distance is at
     ! least sqrt(metric) times the slanted gap (module atomcells; metric is 1 in
     ! orthorhombic cells).
-    ! The containment test is upstream's, so the same sphere radius is found.
+    ! The containment test is upstream's, so the same sphere radius is found. With MPI,
+    ! each rank finds the largest sphere among its own slab's cubelets (the blocks hold
+    ! only those), and the sample's answer is the largest over the ranks.
     ortho = fundcell_isortho(fcell)
     metric = atomcells_metric()
-    rmax2 = PA1(ng_cubes)
+    rmax2 = -huge(0.0d0)
+    if(ng_local > 0) rmax2 = PA1(ng_local)
+    rmax2 = par_max_d(rmax2)
     bsz = max(8, int(sqrt(rmax2)/(6.0d0*cube_size)) + 1)
     nb = (/ (ncubesx+bsz-1)/bsz, (ncubesy+bsz-1)/bsz, (ncubesz+bsz-1)/bsz /)
-    allocate(blockmax(0:nb(1)-1, 0:nb(2)-1, 0:nb(3)-1))
+    bz0 = (z0-1)/bsz
+    bz1 = (z1-1)/bsz
+    allocate(blockmax(0:nb(1)-1, 0:nb(2)-1, bz0:bz1))
     blockmax = -1.0d0
-    do l=1, ncubesz
+    do l=z0, z1
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l)<1) cycle
@@ -1323,10 +1527,10 @@ subroutine pore_distribution
         end do
     end do
     ! The blocks, sorted by the largest radius they hold (ascending; visited from the end)
-    nblocks = nb(1)*nb(2)*nb(3)
+    nblocks = nb(1)*nb(2)*(bz1-bz0+1)
     allocate(bkey(nblocks), bxs(nblocks), bys(nblocks), bzs(nblocks))
     n = 0
-    do l=0, nb(3)-1
+    do l=bz0, bz1
         do k=0, nb(2)-1
             do j=0, nb(1)-1
                 n = n + 1
@@ -1343,19 +1547,20 @@ subroutine pore_distribution
     !$omp end single
     !$omp end parallel
 
-    !$omp parallel do default(shared) schedule(dynamic, 16) private(i, n, d, isite, nx, ny, nz, j1, k1, l1, &
-    !$omp atvec1, atvec2, sepvec, rdist2, sigma2_ref, sigma_ref, bin, best, v, t, g2, xq, lo, hi, bx, by, bz)
+    !$omp parallel do default(shared) schedule(dynamic, 16) private(i, n, d, nx, ny, nz, j1, k1, l1, &
+    !$omp atvec1, atvec2, sepvec, rdist2, best, v, t, g2, xq, lo, hi, bx, by, bz)
     do i = 1, nsamples
-        isite = sites(i)
-        call cube_ijk(n_cubes(isite), nx, ny, nz)
+        nx = sxyz(1, i)
+        ny = sxyz(2, i)
+        nz = sxyz(3, i)
 
         atvec1%comp(1) = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         atvec1%comp(2) = dble(ny-1)*cube_size+0.5*cube_size
         atvec1%comp(3) = dble(nz-1)*cube_size+0.5*cube_size
         xq = atvec1%comp
 
-        ! the sample's own cubelet contains it, so its radius is a first answer
-        best = lattice_rdist2(nx, ny, nz)
+        ! start from the sample's own cubelet (it contains the point)
+        best = sbest(i)
 
         do n = nblocks, 1, -1
             if(bkey(n) <= best) exit                      ! no block left can beat it
@@ -1379,7 +1584,7 @@ subroutine pore_distribution
                 end do
                 if(metric*g2 > bkey(n)*(1.0d0 + 1.0d-9) + 1.0d-9) cycle
             end if
-            do l1 = bz*bsz+1, min((bz+1)*bsz, ncubesz)
+            do l1 = max(bz*bsz+1, z0), min((bz+1)*bsz, ncubesz, z1)
                 do k1 = by*bsz+1, min((by+1)*bsz, ncubesy)
                     do j1 = bx*bsz+1, min((bx+1)*bsz, ncubesx)
                         if(lattice_space(j1,k1,l1)<1) cycle
@@ -1395,17 +1600,19 @@ subroutine pore_distribution
                 end do
             end do
         end do
-        sigma2_ref = best
-
-        sigma_ref = sqrt(sigma2_ref)                   ! sigma here is distance, not diameter
-        bin=int(2.0*sigma_ref/binsize)+1               ! distribution bin (2 is needed to make sigma proper diameter)
-
-        if (bin > ubound(psd_cumul, 1)) bin = ubound(psd_cumul, 1)
-        bins(i) = bin
-
+        sbest(i) = best
     end do
     !$omp end parallel do
     deallocate(blockmax, bkey, bxs, bys, bzs)
+    call par_max_d_array(sbest, nsamples)
+
+    do i = 1, nsamples
+        sigma2_ref = sbest(i)
+        sigma_ref = sqrt(sigma2_ref)                   ! sigma here is distance, not diameter
+        bin=int(2.0*sigma_ref/binsize)+1               ! distribution bin (2 is needed to make sigma proper diameter)
+        if (bin > ubound(psd_cumul, 1)) bin = ubound(psd_cumul, 1)
+        bins(i) = bin
+    end do
 
     ! Update the cumulative distribution in sample order
     do i = 1, nsamples
@@ -1413,10 +1620,16 @@ subroutine pore_distribution
             psd_cumul(m)=psd_cumul(m)+1
         end do
     end do
-    deallocate(sites, bins)
+    deallocate(sxyz, sbest, bins)
 
+    ! rank 0 writes the files (every rank has the same distribution)
+    if(par_rank == 0) then
     open(13, file='psd_cumulative.txt', status='unknown') ! The file for cumulative Vp function
     open(14, file='psd.txt', status='unknown')            ! File containing pore size distribution
+    else
+    open(13, file='/dev/null', status='old', action='write')
+    open(14, file='/dev/null', status='old', action='write')
+    end if
 
     write(13, *) '# Cumulative accessible volume distribution as a function of probe diameter'
     write(13, *) '# '
@@ -1487,10 +1700,14 @@ subroutine limiting_diameter
 
     use percolation, only: percolation_calc_simple
     use results
+    use parallel, only: par_max_d, par_min_d, par_allgather_d
 
     implicit none
     real*8  :: rhigh, rlow, rmiddle, rmax, rdiff, rdiff_old
     integer :: i, j, percolation_type, i1, k1, l1
+    integer :: nbelow, nlow
+    real*8  :: lmax, lmin, v, low2(2)
+    real*8, allocatable :: lows(:)
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Starting limiting pore diameter and maximum pore size !"
@@ -1498,9 +1715,18 @@ subroutine limiting_diameter
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    rmax  = maxval(PA1)
-    rhigh = maxval(PA1)
-    rlow  = minval(PA1)
+    ! The radii are sorted per rank (all of them on one rank); the bisection needs only
+    ! the largest and smallest radius, how many lie below the probe, and the radii next to
+    ! that position in the sorted list of the whole grid, which the ranks find together
+    lmax = -huge(0.0d0)
+    lmin = huge(0.0d0)
+    if(ng_local > 0) then
+        lmax = PA1(ng_local)
+        lmin = PA1(1)
+    end if
+    rmax  = par_max_d(lmax)
+    rhigh = rmax
+    rlow  = par_min_d(lmin)
     rdiff = 0.0
 
     do i=1, 100000 ! here we employ bisection method + percolation analysis to find the largest probe
@@ -1511,15 +1737,14 @@ subroutine limiting_diameter
         if(abs(rdiff)<0.25.or.(rdiff==rdiff_old)) exit ! convergence is achieved
         rmiddle = 0.5*(rhigh+rlow)
 
-        ! j: the last sorted radius below rmiddle, as upstream finds it
-        do j=ng_cubes, 1, -1
-            if(PA1(j) < rmiddle) exit
-        end do
+        ! j, the last sorted radius below rmiddle (as upstream finds it), is the number of
+        ! radii below rmiddle: nbelow on this rank
+        nbelow = count_below(rmiddle)
 
         ! the geometrically accessible cubelets with a radius of at least rmiddle (upstream
         ! marked the sorted entries above j, the same cubelets)
         !$omp parallel do default(shared) private(i1, k1, l1)
-        do l1=1, ncubesz
+        do l1=z0, z1
             do k1=1, ncubesy
                 do i1=1, ncubesx
                     lattice_temp(i1,k1,l1) = 0
@@ -1534,11 +1759,32 @@ subroutine limiting_diameter
         call percolation_calc_simple(lattice_temp, cl_summary, spanning)
 
         if(spanning>0) then
-            rlow  = PA1(j-1)
+            ! PA1(j-1): the second largest radius below rmiddle, counting repeats (the
+            ! smallest radius if there is only one)
+            nlow = 0
+            if(nbelow >= 1) then
+                nlow = nlow + 1
+                low2(nlow) = PA1(nbelow)
+            end if
+            if(nbelow >= 2) then
+                nlow = nlow + 1
+                low2(nlow) = PA1(nbelow-1)
+            end if
+            call par_allgather_d(low2(1:nlow), lows)
+            if(size(lows) >= 2) then
+                rlow = second_largest(lows)
+            else
+                rlow = par_min_d(lmin)
+            end if
+            deallocate(lows)
             percolation_type = spanning
             cycle
         else
-            rhigh = PA1(j+1)
+            ! PA1(j+1): the smallest radius not below rmiddle (the largest if there is none)
+            v = huge(0.0d0)
+            if(nbelow < ng_local) v = PA1(nbelow+1)
+            rhigh = par_min_d(v)
+            if(rhigh == huge(0.0d0)) rhigh = rmax
             cycle
         end if
 
@@ -1568,6 +1814,43 @@ subroutine limiting_diameter
 
     return
 
+contains
+
+    ! How many of this rank's sorted radii are below r (binary search)
+    integer function count_below(r)
+        real*8, intent(in) :: r
+        integer            :: lo, hi, mid
+        lo = 0
+        hi = ng_local
+        do while(lo < hi)
+            mid = lo + (hi - lo + 1)/2
+            if(PA1(mid) < r) then
+                lo = mid
+            else
+                hi = mid - 1
+            end if
+        end do
+        count_below = lo
+    end function count_below
+
+    ! The second largest of v, counting repeats
+    real*8 function second_largest(v)
+        real*8, intent(in) :: v(:)
+        real*8             :: a, b
+        integer            :: n
+        a = -huge(0.0d0)
+        b = -huge(0.0d0)
+        do n=1, size(v)
+            if(v(n) > a) then
+                b = a
+                a = v(n)
+            else if(v(n) > b) then
+                b = v(n)
+            end if
+        end do
+        second_largest = b
+    end function second_largest
+
 end subroutine limiting_diameter
 
 !--------------------------------------------------------------------------------------
@@ -1583,25 +1866,58 @@ subroutine nitrogen_lattice_vis(option)
     use fundcell, only:     fundcell_unslant
     use vector, only:       vectype
     use defaults, only:     radTodeg
+    use parallel, only:     par_rank, par_size, par_owner, par_send_i8, par_recv_i8, par_send_r4, par_recv_r4
 
     implicit none
     integer                            :: option
-    integer                            :: nx, ny, nz, nxlow, nxup, nylow, nyup, nzlow, nzup, i, j, k
+    integer                            :: nx, ny, nz, nxlow, nxup, nylow, nyup, nzlow, nzup, i, j, k, r
     integer                            :: ncx, ncy, ncz
     real                               :: x, y, z, field
     type(vectype)                      :: atvec1
     real, allocatable                  :: plane(:,:)
+    integer*8                          :: cnt(1)
+    integer*8, allocatable             :: cubes(:)
 
-    
+    ! Rank 0 writes both files; with MPI the other ranks send it their parts in order
     if(option==1) then
     ! Creating a grid of lattice sites accessible to nitrogen probe in xyz fornat
+    if(par_rank > 0) then
+        cnt(1) = nn_local
+        call par_send_i8(cnt, 1, 0, 31)
+        allocate(cubes(max(1, nn_local)))
+        do i=1, nn_local
+            cubes(i) = n_cubes(i)
+        end do
+        if(nn_local > 0) call par_send_i8(cubes, nn_local, 0, 32)
+        deallocate(cubes)
+        return
+    end if
     open(110, file='nitrogen_network.xyz', status='unknown')
 
-    write(110,*) nn_cubes
+    if(nn_cubes <= huge(0)) then
+        write(110,*) int(nn_cubes)
+    else
+        write(110,*) nn_cubes
+    end if
     write(110,*)
 
-    do i=1, nn_cubes
-        call cube_ijk(n_cubes(i), nx, ny, nz)
+    do r=0, par_size-1
+        if(r == 0) then
+            allocate(cubes(max(1, nn_local)))
+            cnt(1) = nn_local
+            do i=1, nn_local
+                cubes(i) = n_cubes(i)
+            end do
+        else
+            call par_recv_i8(cnt, 1, r, 31)
+            allocate(cubes(max(1_8, cnt(1))))
+            if(cnt(1) > 0) call par_recv_i8(cubes, int(cnt(1)), r, 32)
+        end if
+        do i=1, int(cnt(1))
+        ! the local cube number on rank r: j fastest, then k, then the plane from its first
+        nx = int(mod(cubes(i) - 1, int(ncubesx, 8))) + 1
+        ny = int(mod((cubes(i) - 1)/ncubesx, int(ncubesy, 8))) + 1
+        nz = int((cubes(i) - 1)/(int(ncubesx, 8)*ncubesy)) + slab_first(r)
 
         x = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         y = dble(ny-1)*cube_size+0.5*cube_size
@@ -1618,12 +1934,23 @@ subroutine nitrogen_lattice_vis(option)
         atvec1 = fundcell_unslant(fcell, atvec1)
 
         write(110,*) "N ", atvec1%comp(1), atvec1%comp(2), atvec1%comp(3)
+        end do
+        deallocate(cubes)
     end do
     close(110)
     return
     endif
 
     if(option==2) then
+   allocate(plane(ncubesx, ncubesy))
+   if(par_rank > 0) then
+       do k=z0, z1
+           call fill_plane(k)
+           call par_send_r4(plane, ncubesx*ncubesy, 0, 33)
+       end do
+       deallocate(plane)
+       return
+   end if
     open(111, file='nitrogen_network.grd', status='unknown')
 
     write(111,*) "Poreblazer nitrogen accessible grid: field = r"
@@ -1642,26 +1969,48 @@ subroutine nitrogen_lattice_vis(option)
    ! One write statement per plane (one record per value by format reversion) instead of
    ! one per cubelet: the same file, about 30% faster. The formatting itself is most of
    ! what is left, and libgfortran serialises it, so formatting on threads is slower.
-   allocate(plane(ncubesx, ncubesy))
    do k=1,  ncubesz
-    do j=1, ncubesy
-     do i=1, ncubesx
-
-       if(lattice_rdist2(i,j,k) == 0.0) then
-       plane(i,j) = 0.0
-       else
-       plane(i,j) = sqrt(lattice_rdist2(i,j,k))
-       endif
-    end do
-    end do
+    r = 0
+    if(par_size > 1) r = par_owner(ncubesz, k)
+    if(r == 0) then
+        call fill_plane(k)
+    else
+        call par_recv_r4(plane, ncubesx*ncubesy, r, 33)
+    end if
     write(111,'(e12.5)') plane
-    end do
-    deallocate(plane)
+   end do
+   deallocate(plane)
     close(111)
     return
     end if
 
     return
+
+contains
+
+    ! The first plane of rank r's slab
+    integer function slab_first(r)
+        use parallel, only: par_slab
+        integer, intent(in) :: r
+        integer             :: a, b
+        call par_slab(ncubesz, r, a, b)
+        slab_first = a
+    end function slab_first
+
+    ! plane: the pore radius of every cubelet of plane k (one of this rank's)
+    subroutine fill_plane(k)
+        integer, intent(in) :: k
+        integer             :: i, j
+        do j=1, ncubesy
+            do i=1, ncubesx
+                if(lattice_rdist2(i,j,k) == 0.0) then
+                    plane(i,j) = 0.0
+                else
+                    plane(i,j) = sqrt(lattice_rdist2(i,j,k))
+                endif
+            end do
+        end do
+    end subroutine fill_plane
 
 end subroutine nitrogen_lattice_vis
 

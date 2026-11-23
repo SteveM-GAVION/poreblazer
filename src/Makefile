@@ -59,8 +59,8 @@ endif
 ### ------------ define flags for ifc, intel-linux-compiler by INTEL ---------
 ###
 ###
-ifeq ($(FC),gfortran)
-F90FLAGS = 
+ifneq ($(filter gfortran mpif90,$(FC)),)
+F90FLAGS =
 DEBUG_FLAGS = 
 # -fopenmp: lattice_calculations and pore_distribution run in parallel (OMP_NUM_THREADS)
 # -ffp-contract=off: no fused multiply-adds, so results do not depend on the CPU.
@@ -126,7 +126,7 @@ endif
 %.o : %.f
 	$(FC) $(GEN_FLAGS) $(DEBUG_FLAGS) $(F77FLAGS) $(OFLAGS) -c $<
 
-OBJECTS = defaults.o percolation.o utils.o matrixops.o random.o vector.o \
+OBJECTS = defaults.o parallel.o percolation.o utils.o matrixops.o random.o vector.o \
 fundcell.o matrix.o poreblazer.o 
 
 $(CMD) : $(OBJECTS)
@@ -135,8 +135,17 @@ $(CMD) : $(OBJECTS)
 dec : $(OBJECTS)
 	$(FC) $(DEBUG_FLAGS) $(OFLAGS) $(OBJECTS) -o $(CMD)
 
+# The MPI build (mpif90, -DUSE_MPI): the grid is split over the ranks in slabs of z
+# planes, e.g.  make mpi && OMP_NUM_THREADS=4 mpirun -n 8 ./poreblazer-mpi.exe < input.dat
+# On one rank it gives what poreblazer.exe gives. It builds in build-mpi/, so the two
+# builds sit side by side.
+mpi :
+	mkdir -p build-mpi
+	cp *.f90 build-mpi/
+	$(MAKE) -C build-mpi -f ../Makefile FC=mpif90 DFLAGS=-DUSE_MPI CMD=../poreblazer-mpi.exe
+
 clean:
-	/bin/rm -f *.o *.i *.mod a.out make.log
+	/bin/rm -rf *.o *.i *.mod a.out make.log build-mpi
 
 cleano:
 	rm -f *.o *.i 
@@ -146,11 +155,12 @@ depend :
 	makemake *.f90 *.F 
 
 defaults.o                :
-percolation.o             :
-utils.o                   : defaults.o
+parallel.o                :
+percolation.o             : parallel.o
+utils.o                  : defaults.o
 matrixops.o               : defaults.o
 random.o                  : defaults.o
 vector.o                  : defaults.o utils.o
 fundcell.o                : defaults.o utils.o vector.o matrix.o
 matrix.o                  : defaults.o utils.o vector.o matrixops.o random.o
-poreblazer.o              : fundcell.o defaults.o random.o vector.o percolation.o
+poreblazer.o              : fundcell.o defaults.o random.o vector.o percolation.o parallel.o

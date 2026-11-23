@@ -105,3 +105,73 @@ of `defaults.dat`):
 
 The log states which labelling ran (`Percolation labelling: exact` or `poreblazer`).
 A `defaults.dat` without the second value behaves exactly as before.
+
+## Exact labelling in parallel, and with less memory
+
+Exact labelling (`exact_percolation` in `percolation.f90`) runs on threads: each thread
+labels its own block of z planes with union-find, the blocks are joined across the planes
+between them, and every site is pointed at its root in parallel. The root of a set is its
+smallest site, so a cluster's root is its first site in scan order, which is the order
+clusters are numbered in, and the result does not depend on the number of threads. It
+keeps one 4-byte parent per site, instead of the 8 bytes (labels and parents) of
+`clusteranalysis_exact` and `span`, and no table sized by the number of clusters (the old
+exact path stopped at 100,000 clusters in the limiting diameter's analysis).
+`tests/test_percolation_mpi.f90` checks it against `clusteranalysis_exact` and `span` on
+300 random lattices, on any number of threads and ranks.
+
+## Wide pores and large structures in the lattice step
+
+- **A widening search instead of every atom.** A cube whose nearest atom or surface could
+  lie beyond the cutoff (a pore wider than about twice the cutoff) is retried with the
+  atoms within twice the radius, then four times, and so on, until its answer is settled
+  or the list holds every atom. Upstream, and the fork before, checked every atom at
+  once. The answer is the same: the atoms added are beyond the cutoff, so the
+  Lennard-Jones sum and the overlap test do not change, and they are farther than the
+  nearest atom and surface found. The wider list is built once per cell-list cell.
+- **Candidate atoms gathered from the cells.** Each cell-list cell's candidate atoms are
+  gathered from the neighbouring cells and sorted, instead of marking them and scanning
+  every atom in the structure. The cost now follows the atoms nearby, not the size of the
+  structure (it was the number of cells times the number of atoms).
+
+## Splitting the grid over MPI ranks
+
+`make -C src mpi` builds `poreblazer-mpi.exe` with `mpif90` (`-DUSE_MPI`; module
+`parallel`, which is a set of single-rank stubs in the serial build). Run it under mpirun
+or srun, with exact labelling, which only it can split:
+
+```
+OMP_NUM_THREADS=4 mpirun -n 8 ./poreblazer-mpi.exe < input.dat
+```
+
+Each rank holds a slab of whole z planes of the grid; every rank reads the whole
+structure, as the atoms are few beside the grid cubes. Each step:
+
+- **Lattice:** each rank computes its own planes; no communication.
+- **Percolation (helium, nitrogen, limiting diameter):** each rank labels its slab, then
+  sends the roots of its bottom plane to the rank below (the halo, periodic). The pairs of
+  roots that meet across a boundary, a few per cluster that crosses one, are shared by
+  every rank and joined with union-find, so a cluster's global root is its first site in
+  the whole grid. Clusters crossing ranks add up their sizes and occupied planes over the
+  ranks; clusters inside one slab need nothing from the others.
+- **Helium volume:** the Boltzmann factors are computed on every rank in parallel; the sum
+  is passed from rank to rank in plane order, so it is added in upstream's order.
+- **Surface area:** every rank draws every random number (the stream stays in step), and
+  tests only the trial points in its own planes; the counts are summed.
+- **Pore size distribution:** each sample's cube is found by the rank holding it, and
+  every rank finds the largest sphere among its own cubes containing the point; the
+  sample's answer is the largest over the ranks.
+- **Limiting diameter:** each rank sorts its own radii; the bisection needs only the
+  smallest and largest radius, how many lie below the probe, and the radii next to that
+  position, which the ranks find together.
+- **Output:** rank 0 writes the log and every file; the other ranks send it their planes
+  of `nitrogen_network.grd` and their parts of `nitrogen_network.xyz`, in order. Only rank
+  0 reads stdin, and it passes the three lines on.
+
+On any number of ranks the output is identical to the serial build's: `tests/run_tests.py
+--fork src/poreblazer-mpi.exe --mpi 1 2 3 4` checks the log (less the line naming the
+ranks) and every file against `tests/reference_exact.json`. The log says `MPI ranks: N`
+when there are more than one. Memory per rank is the fixed part plus the slab's share of
+the grid. Global cube counts are 8-byte, so a grid may hold more than 2**31 cubes; one rank
+may hold up to 2**31.
+
+`POREBLAZER_TIMING=1` makes rank 0 write each step's wall time to stderr (not the log).
