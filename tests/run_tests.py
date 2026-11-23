@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,7 @@ CASES = [
 ]
 EXACT_REFERENCE = os.path.join(HERE, "reference_exact.json")
 LABELLING_LINE = "Percolation labelling:"
+RANKS_LINE = "MPI ranks:"
 
 
 def defaults_dat(case_dir, cubelet, labelling):
@@ -59,7 +61,7 @@ def defaults_dat(case_dir, cubelet, labelling):
     return "\n".join(values) + "\n\n"
 
 
-def run(exe, case, threads, labelling):
+def run(exe, case, threads, labelling, launcher=()):
     """Run exe on a case; return the log (less the labelling line), the sha256 of every
     file written, and the wall time"""
     name, case_dir, cubelet = case
@@ -82,13 +84,13 @@ def run(exe, case, threads, labelling):
             stdin = f.read()
         env = dict(os.environ, OMP_NUM_THREADS=str(threads))
         start = time.time()
-        proc = subprocess.run([os.path.abspath(exe)], input=stdin, cwd=rundir, env=env,
+        proc = subprocess.run(list(launcher) + [os.path.abspath(exe)], input=stdin, cwd=rundir, env=env,
                               capture_output=True, text=True)
         wall = time.time() - start
         if proc.returncode != 0:
             raise RuntimeError("%s failed on %s (exit %d):\n%s" % (exe, name, proc.returncode,
                                                                    proc.stderr[-2000:]))
-        log = [line for line in proc.stdout.splitlines() if LABELLING_LINE not in line]
+        log = [line for line in proc.stdout.splitlines() if LABELLING_LINE not in line and RANKS_LINE not in line]
         files = {}
         for entry in sorted(os.listdir(rundir)):
             if entry in inputs:
@@ -125,10 +127,36 @@ def main():
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--cases", nargs="+", help="run only these cases")
     parser.add_argument("--write-exact-reference", action="store_true")
+    parser.add_argument("--mpi", type=int, nargs="+", metavar="RANKS",
+                        help="--fork is the MPI build (make mpi): run exact labelling under mpirun on each number "
+                             "of ranks and check it against the reference")
+    parser.add_argument("--mpirun", default="mpirun", help="the MPI launcher (default mpirun)")
     args = parser.parse_args()
     cases = [c for c in CASES if not args.cases or c[0] in args.cases]
 
     failures = []
+    if args.mpi:
+        with open(EXACT_REFERENCE) as f:
+            exact_reference = json.load(f)
+        for case in cases:
+            name = case[0]
+            for ranks in args.mpi:
+                for threads in args.threads:
+                    r = run(args.fork, case, threads, "exact", launcher=tuple(shlex.split(args.mpirun)) + ("-n", str(ranks)))
+                    diff = differences(r, exact_reference[name])
+                    if diff:
+                        failures.append("%s exact, %d ranks x %d threads: %s" % (name, ranks, threads, "; ".join(diff)))
+                    print("%-20s exact %2d ranks x %2d threads %6.1f s  %s" % (
+                        name, ranks, threads, r["wall"], "matches reference" if not diff else "DIFFERS: " + "; ".join(diff)),
+                        flush=True)
+        if failures:
+            print("\n%d failure(s):" % len(failures))
+            for f in failures:
+                print("  " + f)
+            return 1
+        print("\nAll MPI cases passed")
+        return 0
+
     if args.write_exact_reference:
         reference = {}
         for case in cases:
