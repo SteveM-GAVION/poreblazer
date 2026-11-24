@@ -343,6 +343,8 @@ subroutine initialize(filename)
     type(vectype)                         ::  atvec1
     character(256)                        :: visline                                    ! the visualisation line of defaults.dat
     integer                               :: ios
+    character(256)                        :: offset_env                                 ! POREBLAZER_GRID_OFFSET
+    real*8                                :: grid_offset(3)                             ! its fractions of a cubelet
 
     ! Initialization cycle
 
@@ -491,6 +493,31 @@ subroutine initialize(filename)
     coords(2, :) = coords(2, :) - atvec1%comp(2)
     coords(3, :) = coords(3, :) - atvec1%comp(3)
 
+
+    ncubesx = int(fcell%eff(1)/cube_size)                ! number of cubelets on x side
+    cube_size = fcell%eff(1)/dble(ncubesx)               ! corrected size of the cubelet
+    ncubesx = int(fcell%eff(1)/cube_size)                ! number of cubelets on x side
+    ncubesy = int(fcell%eff(2)/cube_size)                ! number of cubelets on y side
+    ncubesz = int(fcell%eff(3)/cube_size)                ! number of cubelets on z side
+
+    ! With POREBLAZER_GRID_OFFSET="fx fy fz" (fork only), the structure moves against the grid by
+    ! these fractions of a cubelet along the cell's sides, to measure how much the results depend
+    ! on where the grid falls; without it the grid starts at the lowest atom, as in 3.0.5
+    call get_environment_variable("POREBLAZER_GRID_OFFSET", offset_env)
+    if(len_trim(offset_env) > 0) then
+        read(offset_env,*,iostat=ios) grid_offset
+        if(ios /= 0) call par_abort("POREBLAZER_GRID_OFFSET needs three numbers, fractions of a cubelet")
+        write(*,'(a, 3f9.5)') "  Grid offset (cubelets):", grid_offset
+        atvec1%comp = grid_offset*cube_size
+        do i=1, natoms
+            matvec(i)%comp = matvec(i)%comp + atvec1%comp
+        end do
+        atvec1 = fundcell_unslant(fcell, atvec1)
+        do i=1, natoms
+            coords(:, i) = coords(:, i) + atvec1%comp
+        end do
+    end if
+
     if(par_rank == 0) then
     open(40, file = 'new.xyz')
     write(40,*) natoms     !  number of atoms in the strucutre
@@ -503,12 +530,6 @@ subroutine initialize(filename)
 
     close(40)
     end if
-
-    ncubesx = int(fcell%eff(1)/cube_size)                ! number of cubelets on x side
-    cube_size = fcell%eff(1)/dble(ncubesx)               ! corrected size of the cubelet
-    ncubesx = int(fcell%eff(1)/cube_size)                ! number of cubelets on x side
-    ncubesy = int(fcell%eff(2)/cube_size)                ! number of cubelets on y side
-    ncubesz = int(fcell%eff(3)/cube_size)                ! number of cubelets on z side
 
     ntot = int(ncubesx, 8)*ncubesy*ncubesz               ! total number of lattice cubelets in the system
 
